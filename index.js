@@ -17,91 +17,70 @@ const io = new Server(httpServer, {
 const users = new Map();        // userId -> socketId
 const sockets = new Map();      // socketId -> userId
 const offlineQueue = new Map(); // userId -> [messages]
-const statusStore = new Map();  // userId -> [statusItems]  ← NEW: persists status
-const nearbyUsers = new Map();  // userId -> { lastSeen, socketId } ← NEW: proximity
+const statusStore = new Map();  // userId -> [statusItems]
+const nearbyUsers = new Map();  // userId -> { lastSeen }
 
 function getSocket(userId) { return users.get(userId); }
 
-// ── Status cleanup: remove expired (24h) statuses ────────────────────────
-function cleanExpiredStatuses() {
+// ── Cleanup expired statuses every hour ───────────────────────────────────
+setInterval(() => {
   const now = Date.now();
-  const TTL = 24 * 60 * 60 * 1000; // 24 hours
   for (const [userId, items] of statusStore.entries()) {
-    const fresh = items.filter(item => now - item.timestamp < TTL);
-    if (fresh.length === 0) {
-      statusStore.delete(userId);
-    } else {
-      statusStore.set(userId, fresh);
-    }
+    const fresh = items.filter(i => now - i.timestamp < 24 * 60 * 60 * 1000);
+    if (fresh.length === 0) statusStore.delete(userId);
+    else statusStore.set(userId, fresh);
   }
-}
-// Run cleanup every hour
-setInterval(cleanExpiredStatuses, 60 * 60 * 1000);
+}, 60 * 60 * 1000);
 
-// ── Nearby cleanup: remove stale entries (5 min) ─────────────────────────
-function cleanNearby() {
+// ── Cleanup stale nearby every minute ────────────────────────────────────
+setInterval(() => {
   const now = Date.now();
-  for (const [userId, data] of nearbyUsers.entries()) {
-    if (now - data.lastSeen > 5 * 60 * 1000) {
-      nearbyUsers.delete(userId);
-    }
+  for (const [uid, data] of nearbyUsers.entries()) {
+    if (now - data.lastSeen > 5 * 60 * 1000) nearbyUsers.delete(uid);
   }
-}
-setInterval(cleanNearby, 60 * 1000);
+}, 60 * 1000);
 
 // ─────────────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   const userId = socket.handshake.query.userId;
   if (!userId) return;
 
-  // Register user
   users.set(userId, socket.id);
   sockets.set(socket.id, userId);
-  nearbyUsers.set(userId, { lastSeen: Date.now(), socketId: socket.id });
-  console.log(`[+] ${userId} (${socket.id})`);
+  nearbyUsers.set(userId, { lastSeen: Date.now() });
+  console.log(`[+] ${userId}`);
 
-  // ── Deliver offline queue ───────────────────────────────────────────────
+  // ── Deliver offline queue ──────────────────────────────────────────────
   if (offlineQueue.has(userId)) {
     const queued = offlineQueue.get(userId);
     queued.forEach(msg => socket.emit('message', msg));
     offlineQueue.delete(userId);
-    console.log(`[~] delivered ${queued.length} queued msgs to ${userId}`);
+    console.log(`[~] delivered ${queued.length} queued to ${userId}`);
   }
 
-  // ── Send stored statuses to newly connected user ────────────────────────
-  // They will see all statuses that were posted while they were offline
+  // ── Send stored statuses on connect ───────────────────────────────────
   const allStatuses = [];
-  for (const [statusUserId, items] of statusStore.entries()) {
-    if (statusUserId !== userId) {
-      items.forEach(item => {
-        allStatuses.push({ item, from: statusUserId });
-      });
+  for (const [uid, items] of statusStore.entries()) {
+    if (uid !== userId) {
+      items.forEach(item => allStatuses.push({ item, from: uid }));
     }
   }
-  if (allStatuses.length > 0) {
-    socket.emit('status-bulk', allStatuses);
-  }
+  if (allStatuses.length > 0) socket.emit('status-bulk', allStatuses);
+  if (statusStore.has(userId)) socket.emit('status-mine', statusStore.get(userId));
 
-  // ── Also send own stored statuses back ─────────────────────────────────
-  if (statusStore.has(userId)) {
-    socket.emit('status-mine', statusStore.get(userId));
-  }
-
-  // ── MESSAGING ────────────────────────────────────────────────────────────
+  // ── MESSAGING ─────────────────────────────────────────────────────────
   socket.on('message', (msg) => {
     if (!msg || !msg.to || !msg.id) return;
-
-    const targetSocket = getSocket(msg.to);
-    if (targetSocket) {
-      io.to(targetSocket).emit('message', msg);
+    const t = getSocket(msg.to);
+    if (t) {
+      io.to(t).emit('message', msg);
       socket.emit('message-sent', { messageId: msg.id });
-      console.log(`[>] ${userId} -> ${msg.to}: ${msg.text?.slice(0, 30) || '[media]'}`);
+      console.log(`[>] ${userId} -> ${msg.to}`);
     } else {
-      // Queue for offline user
       if (!offlineQueue.has(msg.to)) offlineQueue.set(msg.to, []);
       offlineQueue.get(msg.to).push(msg);
       socket.emit('message-queued', { messageId: msg.id });
-      console.log(`[Q] queued for offline ${msg.to}`);
+      console.log(`[Q] queued for ${msg.to}`);
     }
   });
 
@@ -120,7 +99,7 @@ io.on('connection', (socket) => {
     if (t) io.to(t).emit('typing', { from: userId, isTyping });
   });
 
-  // ── GROUP MESSAGING ───────────────────────────────────────────────────────
+  // ── GROUP MESSAGING ───────────────────────────────────────────────────
   socket.on('group-message', ({ groupId, message, memberIds }) => {
     (memberIds || []).forEach(memberId => {
       if (memberId === userId) return;
@@ -142,7 +121,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ── WEBRTC SIGNALING ──────────────────────────────────────────────────────
+  // ── WEBRTC SIGNALING ──────────────────────────────────────────────────
   socket.on('offer', ({ to, offer, type }) => {
     const t = getSocket(to);
     if (t) io.to(t).emit('offer', { from: userId, offer, type });
@@ -169,30 +148,62 @@ io.on('connection', (socket) => {
     if (t) io.to(t).emit('call-rejected', { from: userId });
   });
 
-  // ── STATUS — now with persistence ─────────────────────────────────────────
-  socket.on('status-post', ({ item, friendIds }) => {
-    // Store status so offline users see it when they come online
-    if (!statusStore.has(userId)) statusStore.set(userId, []);
-    const userStatuses = statusStore.get(userId);
-
-    // Replace if same id, otherwise add
-    const existingIdx = userStatuses.findIndex(s => s.id === item.id);
-    if (existingIdx >= 0) {
-      userStatuses[existingIdx] = item;
+  // ── P2P FILE TRANSFER SIGNALING ───────────────────────────────────────
+  // Sender requests to send file — receiver gets confirmation prompt
+  socket.on('p2p-request', ({ transferId, to, fileName, fileSize, fileType }) => {
+    const t = getSocket(to);
+    if (t) {
+      io.to(t).emit('p2p-request', { transferId, from: userId, fileName, fileSize, fileType });
+      console.log(`[P2P] ${userId} -> ${to}: ${fileName}`);
     } else {
-      userStatuses.push(item);
+      // Receiver offline — notify sender
+      socket.emit('p2p-offline', { transferId, to });
     }
+  });
 
-    // Broadcast to all online users (not just friendIds)
-    // Since 3rd has no "friends" concept — everyone can see statuses
+  // Receiver accepted — sender can start WebRTC
+  socket.on('p2p-accepted', ({ transferId, to }) => {
+    const t = getSocket(to);
+    if (t) io.to(t).emit('p2p-accepted', { transferId, from: userId });
+  });
+
+  // Receiver declined
+  socket.on('p2p-declined', ({ transferId, to }) => {
+    const t = getSocket(to);
+    if (t) io.to(t).emit('p2p-declined', { transferId, from: userId });
+  });
+
+  // WebRTC handshake for P2P — server just routes, never sees content
+  socket.on('p2p-offer', ({ transferId, to, offer }) => {
+    const t = getSocket(to);
+    if (t) io.to(t).emit('p2p-offer', { transferId, from: userId, offer });
+  });
+
+  socket.on('p2p-answer', ({ transferId, to, answer }) => {
+    const t = getSocket(to);
+    if (t) io.to(t).emit('p2p-answer', { transferId, from: userId, answer });
+  });
+
+  socket.on('p2p-ice', ({ transferId, to, candidate }) => {
+    const t = getSocket(to);
+    if (t) io.to(t).emit('p2p-ice', { transferId, from: userId, candidate });
+  });
+
+  // ── STATUS ────────────────────────────────────────────────────────────
+  socket.on('status-post', ({ item }) => {
+    if (!item) return;
+    if (!statusStore.has(userId)) statusStore.set(userId, []);
+    const items = statusStore.get(userId);
+    const idx = items.findIndex(s => s.id === item.id);
+    if (idx >= 0) items[idx] = item;
+    else items.push(item);
     socket.broadcast.emit('status-new', { item, from: userId });
     console.log(`[S] ${userId} posted status`);
   });
 
   socket.on('status-delete', ({ itemId }) => {
     if (statusStore.has(userId)) {
-      const filtered = statusStore.get(userId).filter(s => s.id !== itemId);
-      statusStore.set(userId, filtered);
+      statusStore.set(userId, statusStore.get(userId).filter(s => s.id !== itemId));
     }
     socket.broadcast.emit('status-deleted', { itemId, from: userId });
   });
@@ -202,60 +213,43 @@ io.on('connection', (socket) => {
     if (t) io.to(t).emit('status-seen', { viewerId: userId });
   });
 
-  // ── NEARBY DISCOVERY — NEW ────────────────────────────────────────────────
-  // User announces they are looking for nearby users
-  socket.on('nearby-ping', ({ userId: pingUserId }) => {
-    // Update their last seen
-    nearbyUsers.set(userId, { lastSeen: Date.now(), socketId: socket.id });
-
-    // Get all online users (connected in last 5 minutes)
+  // ── NEARBY DISCOVERY ──────────────────────────────────────────────────
+  socket.on('nearby-ping', () => {
+    nearbyUsers.set(userId, { lastSeen: Date.now() });
     const now = Date.now();
-    const nearbyList = [];
-    for (const [nearId, data] of nearbyUsers.entries()) {
-      if (nearId === userId) continue;
+    const nearby = [];
+    for (const [uid, data] of nearbyUsers.entries()) {
+      if (uid === userId) continue;
       if (now - data.lastSeen > 5 * 60 * 1000) continue;
-      if (!users.has(nearId)) continue; // must be online
-      nearbyList.push({ userId: nearId });
+      if (!users.has(uid)) continue;
+      nearby.push({ userId: uid });
     }
-
-    // Send back list of nearby users
-    socket.emit('nearby-users', { users: nearbyList });
-    console.log(`[P] ${userId} pinged nearby, found ${nearbyList.length} users`);
+    socket.emit('nearby-users', { users: nearby });
   });
 
-  // User requests to connect with a nearby user
-  socket.on('nearby-request', ({ to, from: fromId }) => {
+  socket.on('nearby-request', ({ to }) => {
     const t = getSocket(to);
-    if (t) {
-      io.to(t).emit('nearby-request', { from: userId });
-      console.log(`[N] ${userId} -> ${to} nearby request`);
-    }
+    if (t) io.to(t).emit('nearby-request', { from: userId });
   });
 
-  // User accepts nearby request
   socket.on('nearby-accept', ({ to }) => {
     const t = getSocket(to);
-    if (t) {
-      io.to(t).emit('nearby-accepted', { from: userId });
-    }
+    if (t) io.to(t).emit('nearby-accepted', { from: userId });
   });
 
-  // User declines nearby request
   socket.on('nearby-decline', ({ to }) => {
     const t = getSocket(to);
-    if (t) {
-      io.to(t).emit('nearby-declined', { from: userId });
-    }
+    if (t) io.to(t).emit('nearby-declined', { from: userId });
   });
 
-  // ── PRESENCE / DISCONNECT ─────────────────────────────────────────────────
+  // ── DISCONNECT ────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     const uid = sockets.get(socket.id);
     if (uid) {
       users.delete(uid);
       sockets.delete(socket.id);
       nearbyUsers.delete(uid);
-      console.log(`[-] ${uid} disconnected`);
+      console.log(`[-] ${uid}`);
     }
   });
 });
