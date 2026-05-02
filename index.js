@@ -265,3 +265,97 @@ httpServer.listen(PORT, () => {
   └──────────────────────────────────────┘
   `);
 });
+
+// ── COMMONS (shared community requests + uploads) ────────────────────────
+const commonsRequests = new Map(); // requestId -> request object
+const commonsUploads  = new Map(); // uploadId  -> upload object
+
+// Cleanup expired uploads every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [id, upload] of commonsUploads.entries()) {
+    if (upload.expiresAt && upload.expiresAt < now) {
+      commonsUploads.delete(id);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    // Notify all connected users
+    io.emit('commons-cleanup', { cleaned, at: now });
+    console.log(`[C] cleaned ${cleaned} expired uploads`);
+  }
+}, 10 * 60 * 1000);
+
+io.on('connection', (socket) => {
+  const uid = socket.handshake.query.userId;
+
+  // Send all current commons data on connect
+  socket.on('commons-sync', () => {
+    const now = Date.now();
+    const requests = Array.from(commonsRequests.values());
+    const uploads  = Array.from(commonsUploads.values()).filter(u => !u.expiresAt || u.expiresAt > now);
+    socket.emit('commons-state', { requests, uploads });
+    console.log(`[C] synced ${requests.length} requests + ${uploads.length} uploads to ${uid}`);
+  });
+
+  // Post a new request
+  socket.on('commons-request', (req) => {
+    if (!req || !req.id || !req.title) return;
+    req.userId   = uid;
+    req.createdAt = req.createdAt || Date.now();
+    req.uploads  = [];
+    req.status   = 'open';
+    commonsRequests.set(req.id, req);
+    socket.broadcast.emit('commons-request-new', req);
+    console.log(`[C] new request: "${req.title}" from ${uid}`);
+  });
+
+  // Delete a request (only by owner)
+  socket.on('commons-request-delete', ({ requestId }) => {
+    const req = commonsRequests.get(requestId);
+    if (req && req.userId === uid) {
+      commonsRequests.delete(requestId);
+      io.emit('commons-request-deleted', { requestId });
+    }
+  });
+
+  // Post an upload for a request
+  socket.on('commons-upload', (upload) => {
+    if (!upload || !upload.id || !upload.requestId) return;
+    upload.uploaderId = uid;
+    upload.createdAt  = upload.createdAt || Date.now();
+    upload.views      = 0;
+    commonsUploads.set(upload.id, upload);
+
+    // Update request status
+    const req = commonsRequests.get(upload.requestId);
+    if (req) {
+      req.status = 'fulfilled';
+      commonsRequests.set(upload.requestId, req);
+    }
+
+    // Broadcast to all
+    io.emit('commons-upload-new', upload);
+
+    // Notify the request owner specifically
+    if (req && req.userId) {
+      const ownerSocket = users.get(req.userId);
+      if (ownerSocket) {
+        io.to(ownerSocket).emit('commons-fulfilled', {
+          requestId: upload.requestId,
+          requestTitle: req.title,
+          uploadTitle: upload.title,
+          uploaderId: uid,
+        });
+      }
+    }
+    console.log(`[C] upload "${upload.title}" for request ${upload.requestId} by ${uid}`);
+  });
+
+  // Track upload views
+  socket.on('commons-view', ({ uploadId }) => {
+    const u = commonsUploads.get(uploadId);
+    if (u) { u.views = (u.views || 0) + 1; commonsUploads.set(uploadId, u); }
+  });
+});
